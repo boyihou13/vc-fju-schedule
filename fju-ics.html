@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>課表 ICS 產生器（任意起始日版）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans CJK TC", "PingFang TC", "Microsoft JhengHei", "Arial"; padding: 20px; background:#f7f8fb; color:#111; }
+    h1 { margin:0 0 8px; font-size:20px; }
+    .card { background:white; border-radius:8px; padding:16px; box-shadow:0 6px 18px rgba(16,24,40,0.06); margin-bottom:16px; }
+    label { display:block; margin:8px 0 4px; font-weight:600; }
+    input[type="file"] { display:block; }
+    input, button, select { padding:8px 10px; border-radius:6px; border:1px solid #ddd; font-size:14px; }
+    button { background:#0b66ff; color:white; border:0; cursor:pointer; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    .small { font-size:13px; color:#555; }
+    pre { white-space:pre-wrap; background:#0f1724; color:#e6eef8; padding:12px; border-radius:6px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; margin-top:8px; }
+    th, td { padding:8px; text-align:left; border-bottom:1px solid #eee; font-size:13px; }
+    .error { color:#c21; font-weight:700; }
+    .success { color:green; font-weight:700; }
+    .row { display:flex; gap:12px; align-items:center; }
+    .flex { flex:1; }
+    #preview { max-height:240px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h1>課表 ICS 產生器</h1>
+  <div class="card">
+    <div class="small">說明：上傳 <strong>無標頭</strong> 的 CSV（UTF-8），每列 27 欄。請先選擇檔案，再選擇「第 1 週開始日」，按「解析並產生 ICS」。<br/>若選擇的開始日不是週一（如週三），週一與週二的課程將自動順延至第 17 週補課。</div>
+    <label>CSV 檔案（無標頭）</label>
+    <input id="csvfile" type="file" accept=".csv,text/csv" />
+    <label>第 1 週開始日（開學日）</label>
+    <input id="week1" type="date" />
+    <div style="margin-top:10px;" class="row">
+      <button id="genbtn" disabled>解析並產生 ICS</button>
+      <div class="flex small" id="status">等待上傳 CSV...</div>
+    </div>
+    <div style="margin-top:10px;" class="row">
+      <button id="downloadbtn" disabled>下載 ICS 檔案</button>
+      <div class="flex small" id="downloadstatus"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>解析預覽（最多顯示前 50 筆事件規則）</h3>
+    <div id="preview" class="small">尚無資料。</div>
+  </div>
+
+  <div class="card">
+    <h3>錯誤與警告</h3>
+    <div id="errors" class="small">目前無錯誤。</div>
+  </div>
+
+  <script>
+  // 節次對照表 (start, end) in HH:MM format
+  const SECTION_MAP = {
+    "D1": ["08:10","09:00"],
+    "D2": ["09:10","10:00"],
+    "D3": ["10:10","11:00"],
+    "D4": ["11:10","12:00"],
+    "DN": ["12:40","13:30"],
+    "D5": ["13:40","14:30"],
+    "D6": ["14:40","15:30"],
+    "D7": ["15:40","16:30"],
+    "D8": ["16:40","17:30"],
+    "E0": ["17:40","18:30"]
+  };
+
+  // 欄位索引（0-based）
+  const COL = {
+    NO: 0, TAG:1, YEAR:2, SEM:3, CODE:4, MAINCODE:5, ORG:6, SUBJECT:7, CREDIT:8,
+    OPEN_TYPE:9, STUDENT_SETTING:10, CLASSNO:11, TEACHER:12,
+    PERIOD1_WEEKDAY:13, PERIOD1_WEEKTYPE:14, PERIOD1_SECTION:15, PERIOD1_ROOM:16,
+    PERIOD2_WEEKDAY:17, PERIOD2_WEEKTYPE:18, PERIOD2_SECTION:19, PERIOD2_ROOM:20,
+    PERIOD3_WEEKDAY:21, PERIOD3_WEEKTYPE:22, PERIOD3_SECTION:23, PERIOD3_ROOM:24,
+    CORE:25, NOTE:26
+  };
+
+  const fileInput = document.getElementById('csvfile');
+  const week1Input = document.getElementById('week1');
+  const genBtn = document.getElementById('genbtn');
+  const statusDiv = document.getElementById('status');
+  const previewDiv = document.getElementById('preview');
+  const errorsDiv = document.getElementById('errors');
+  const downloadBtn = document.getElementById('downloadbtn');
+  const downloadStatusDiv = document.getElementById('downloadstatus');
+
+  let lastICSBlob = null;
+  let lastFilename = '';
+
+  // helper csv parser
+  function parseCSV(text) {
+    const rows = [];
+    let cur = '', inQuotes = false, row = [], i=0;
+    while (i < text.length) {
+      const ch = text[i];
+      if (ch === '"') {
+        if (inQuotes && i+1 < text.length && text[i+1] === '"') {
+          cur += '"'; i += 2; continue; 
+        }
+        inQuotes = !inQuotes;
+        i++; continue;
+      }
+      if (ch === ',' && !inQuotes) {
+        row.push(cur); cur = ''; i++; continue;
+      }
+      if ((ch === '\n' || ch === '\r') && !inQuotes) {
+        if (ch === '\r' && i+1 < text.length && text[i+1] === '\n') i++;
+        row.push(cur); cur = '';
+        if (row.length === 1 && row[0] === '') { row = []; i++; continue; }
+        rows.push(row); row = []; i++; continue;
+      }
+      cur += ch; i++;
+    }
+    if (inQuotes) throw new Error('CSV 格式錯誤：引號未關閉');
+    if (cur !== '' || row.length > 0) { row.push(cur); rows.push(row); }
+    return rows;
+  }
+
+  function norm(s){ return s === undefined || s === null ? '' : String(s).trim(); }
+
+  // map weekday Chinese to number 1..7 (1=Mon)
+  const WEEKDAY_MAP = { '一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'日':7 };
+
+  // parse section
+  function parseSectionToken(token){
+    token = norm(token).toUpperCase();
+    if (!token) return {ok:false,err:'節次為空'};
+    if (token.includes('-')) {
+      const parts = token.split('-').map(s=>s.trim());
+      if (parts.length !== 2) return {ok:false,err:'節次區間格式錯誤'};
+      const a = parts[0], b = parts[1];
+      if (!(a in SECTION_MAP) || !(b in SECTION_MAP)) return {ok:false,err:'節次代碼不在可接受範圍'};
+      const keys = Object.keys(SECTION_MAP);
+      const ai = keys.indexOf(a), bi = keys.indexOf(b);
+      if (ai === -1 || bi === -1 || ai>bi) return {ok:false,err:'節次區間錯誤（起訖順序）'};
+      return {ok:true, start:a, end:b};
+    } else {
+      if (!(token in SECTION_MAP)) return {ok:false,err:'節次代碼不在可接受範圍'};
+      return {ok:true, start:token, end:token};
+    }
+  }
+
+  function pad(n){ return n<10 ? '0'+n : ''+n; }
+
+  function formatICalDateLocal(dateObj) {
+    return dateObj.getFullYear()
+        + pad(dateObj.getMonth()+1)
+        + pad(dateObj.getDate())
+        + 'T'
+        + pad(dateObj.getHours())
+        + pad(dateObj.getMinutes())
+        + pad(dateObj.getSeconds());
+  }
+
+  // 计算日期：給定第1週的「週一」日期，計算第 weekNumber 週的 weekdayNum (1=Mon)
+  function dateOfWeek(virtualWeek1Monday, weekNumber, weekdayNum) {
+    const base = new Date(virtualWeek1Monday.getFullYear(), virtualWeek1Monday.getMonth(), virtualWeek1Monday.getDate());
+    const daysToAdd = (weekNumber-1)*7 + (weekdayNum-1);
+    base.setDate(base.getDate() + daysToAdd);
+    return base;
+  }
+
+  function makeEvent(opts) {
+    const lines = [];
+    lines.push('BEGIN:VEVENT');
+    lines.push('UID:' + opts.uid);
+    lines.push('DTSTAMP:' + formatICalDateLocal(opts.dtstamp) + 'Z');
+    lines.push('DTSTART;TZID=Asia/Taipei:' + formatICalDateLocal(opts.dtstart));
+    lines.push('DTEND;TZID=Asia/Taipei:' + formatICalDateLocal(opts.dtend));
+    lines.push('SUMMARY:' + escapeICalText(opts.summary));
+    if (opts.location) lines.push('LOCATION:' + escapeICalText(opts.location));
+    if (opts.rruleStr) lines.push('RRULE:' + opts.rruleStr);
+    lines.push('END:VEVENT');
+    return lines.join('\r\n');
+  }
+
+  function escapeICalText(s) {
+    if (!s) return '';
+    return String(s).replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\r\n/g,'\\n').replace(/\n/g,'\\n');
+  }
+
+  function foldICalText(s) {
+    const max = 75;
+    const lines = s.split('\r\n');
+    const out = [];
+    for (const line of lines) {
+      if (line.length <= max) { out.push(line); continue; }
+      let pos = 0;
+      while (pos < line.length) {
+        const chunk = line.substring(pos, pos + max);
+        if (pos === 0) out.push(chunk);
+        else out.push(' ' + chunk);
+        pos += max;
+      }
+    }
+    return out.join('\r\n');
+  }
+
+  function classroomToLocation(room) {
+    if (!room) return null;
+    const t = norm(room);
+    if (/^[A-Za-z]{2}/.test(t)) return t;
+    return null;
+  }
+
+  // main generate function
+  // virtualWeek1Monday: 計算出來的該週週一 (即便開學是週三，這裡傳入的是週一)
+  // pivotWeekday: 使用者選擇的實際開學日星期幾 (1=Mon..7=Sun)
+  async function generateICS(csvText, virtualWeek1Monday, pivotWeekday) {
+    const rows = parseCSV(csvText);
+    const errors = [];
+    const events = [];
+    let eventCount = 0;
+
+    for (let r=0; r<rows.length; r++){
+      const cols = rows[r].map(c => (c===undefined? '' : String(c)));
+      if (cols.length < 27) {
+        errors.push(`第 ${r+1} 列 欄位數量 ${cols.length} < 27。`);
+        continue;
+      }
+      const subj = norm(cols[COL.SUBJECT]);
+      const courseCode = norm(cols[COL.CODE]);
+      if (!subj || !courseCode) continue; 
+
+      for (let p=0; p<3; p++){
+        const baseIdx = 13 + p*4;
+        const weekdayRaw = norm(cols[baseIdx]);
+        const weektypeRaw = norm(cols[baseIdx+1]);
+        const sectionRaw = norm(cols[baseIdx+2]);
+        const roomRaw = norm(cols[baseIdx+3]);
+
+        if (!weekdayRaw && !sectionRaw && !roomRaw && !weektypeRaw) continue;
+
+        if (!weekdayRaw || !(weekdayRaw in WEEKDAY_MAP)) {
+          errors.push(`第 ${r+1} 列 第${p+1}時段：星期錯誤 "${weekdayRaw}"`);
+          continue;
+        }
+        const weekdayNum = WEEKDAY_MAP[weekdayRaw]; // 1=Mon..7=Sun
+        
+        let weektype = weektypeRaw || '全';
+        if (!['全','單','雙'].includes(weektype)) {
+          errors.push(`第 ${r+1} 列 第${p+1}時段：週別錯誤 "${weektypeRaw}"`);
+          continue;
+        }
+
+        const secRes = parseSectionToken(sectionRaw);
+        if (!secRes.ok) { 
+          errors.push(`第 ${r+1} 列 第${p+1}時段：節次錯誤 ${secRes.err}`); 
+          continue; 
+        }
+
+        const startTime = SECTION_MAP[secRes.start][0];
+        const endTime = SECTION_MAP[secRes.end][1];
+
+        // --- 起始週次邏輯判斷 ---
+        // 判斷該課程在本週是否已經「過期」（例如開學日週三，課程在週一 => 過期）
+        const isMissedFirstWeek = (weekdayNum < pivotWeekday);
+        
+        let startWeekNumber = 1;
+
+        if (weektype === '雙') {
+          // 雙週課程永遠從第2週開始 (2, 4, 6...)
+          // 無論第1週有沒有「錯過」，第2週都是完整的
+          startWeekNumber = 2;
+        } else if (weektype === '單') {
+          if (isMissedFirstWeek) {
+            // 單週課程，但第1週錯過了，下一次單週是第3週
+            startWeekNumber = 3; 
+          } else {
+            // 第1週沒錯過
+            startWeekNumber = 1;
+          }
+        } else {
+          // 全
+          if (isMissedFirstWeek) {
+            // 第1週錯過，從第2週開始上 (會在第17週補足)
+            startWeekNumber = 2;
+          } else {
+            // 第1週沒錯過
+            startWeekNumber = 1;
+          }
+        }
+
+        // 計算實際開課日期
+        const dtstartDate = dateOfWeek(virtualWeek1Monday, startWeekNumber, weekdayNum);
+
+        const [sh, sm] = startTime.split(':').map(x=>parseInt(x,10));
+        const [eh, em] = endTime.split(':').map(x=>parseInt(x,10));
+        const dtstart = new Date(dtstartDate.getFullYear(), dtstartDate.getMonth(), dtstartDate.getDate(), sh, sm, 0);
+        const dtend = new Date(dtstartDate.getFullYear(), dtstartDate.getMonth(), dtstartDate.getDate(), eh, em, 0);
+
+        let rrule = '';
+        if (weektype === '全') {
+          rrule = 'FREQ=WEEKLY;COUNT=16';
+        } else {
+          rrule = 'FREQ=WEEKLY;INTERVAL=2;COUNT=8';
+        }
+
+        const location = classroomToLocation(roomRaw);
+        const uid = `${courseCode}-${r+1}-${p+1}-ics-gen@fju`;
+
+        const ev = {
+          uid, dtstamp: new Date(), dtstart, dtend,
+          summary: subj, location, rruleStr: rrule
+        };
+        events.push(ev);
+        eventCount++;
+      } 
+    }
+
+    return {events, errors, eventCount};
+  }
+
+  fileInput.addEventListener('change', (e) => {
+    const f = e.target.files[0];
+    if (!f) {
+      statusDiv.textContent = '未選檔案。';
+      genBtn.disabled = true;
+      downloadBtn.disabled = true;
+      return;
+    }
+    statusDiv.textContent = `已選：${f.name}（${Math.round(f.size/1024)} KB）`;
+    genBtn.disabled = false;
+    previewDiv.textContent = '請選擇「第 1 週開始日」並按解析。';
+    errorsDiv.textContent = '目前無錯誤。';
+    downloadBtn.disabled = true;
+  });
+
+  genBtn.addEventListener('click', async () => {
+    const f = fileInput.files[0];
+    if (!f) { alert('請先選擇 CSV 檔案'); return; }
+    const week1Val = week1Input.value;
+    if (!week1Val) { alert('請選擇第 1 週開始日'); return; }
+    
+    // 使用者選擇的日期 (Start Date)
+    const startDate = new Date(week1Val + 'T00:00:00');
+    // JS getDay(): 0=Sun, 1=Mon...6=Sat. 
+    // 我們需要轉換成 1=Mon...7=Sun 以符合 WEEKDAY_MAP
+    let startDayIdx = startDate.getDay();
+    if (startDayIdx === 0) startDayIdx = 7; 
+    const pivotWeekday = startDayIdx; 
+
+    // 計算 "虛擬的" 本週週一 (Virtual Week 1 Monday)
+    // 公式: StartDate - (pivotWeekday - 1) days
+    const virtualWeek1Mon = new Date(startDate);
+    virtualWeek1Mon.setDate(startDate.getDate() - (pivotWeekday - 1));
+
+    const text = await f.text();
+    let rows;
+    try {
+      rows = parseCSV(text);
+    } catch (err) {
+      alert('CSV 解析失敗：' + err.message);
+      return;
+    }
+
+    // validate format
+    const badRows = [];
+    for (let i=0; i<rows.length; i++){
+      if (rows[i].length < 27) badRows.push(i+1);
+    }
+    if (badRows.length>0) {
+      alert('錯誤：欄位數不足 27 的列： ' + badRows.join(', '));
+      return;
+    }
+
+    // Generate
+    const res = await generateICS(text, virtualWeek1Mon, pivotWeekday);
+    
+    if (res.errors.length > 0) {
+      alert('解析過程發現錯誤，請見下方錯誤列表。');
+      errorsDiv.innerHTML = '<div class="error">' + res.errors.map(e=>escapeHtml(e)).join('<br/>') + '</div>';
+      previewDiv.textContent = '解析失敗。';
+      downloadBtn.disabled = true;
+      return;
+    }
+
+    errorsDiv.innerHTML = '<div class="success">解析成功，產生 ' + res.eventCount + ' 個事件。</div>';
+
+    // Build ICS content
+    const headerLines = [
+      'BEGIN:VCALENDAR',
+      'PRODID:-//FJU ICS Generator//EN',
+      'VERSION:2.0',
+      'CALSCALE:GREGORIAN',
+      'BEGIN:VTIMEZONE',
+      'TZID:Asia/Taipei',
+      'X-LIC-LOCATION:Asia/Taipei',
+      'BEGIN:STANDARD',
+      'TZOFFSETFROM:+0800',
+      'TZOFFSETTO:+0800',
+      'TZNAME:CST',
+      'DTSTART:19700101T000000',
+      'END:STANDARD',
+      'END:VTIMEZONE'
+    ];
+    const bodyLines = res.events.map(makeEvent);
+    const footerLines = ['END:VCALENDAR'];
+    const icalRaw = headerLines.join('\r\n') + '\r\n' + bodyLines.join('\r\n') + '\r\n' + footerLines.join('\r\n');
+    const folded = foldICalText(icalRaw);
+
+    const allRows = parseCSV(text);
+    const first = allRows[0] || [];
+    const year = norm(first[COL.YEAR]) || '';
+    const sem = norm(first[COL.SEM]) || '';
+    const filename = (year && sem) ? `${year}_${sem}_課表.ics` : 'courses.ics';
+
+    lastICSBlob = new Blob([folded], {type:'text/calendar;charset=utf-8'});
+    lastFilename = filename;
+    downloadBtn.disabled = false;
+    downloadStatusDiv.textContent = '已可下載 ICS 檔案';
+
+    // Preview
+    const previewCount = Math.min(res.events.length, 50);
+    let html = '<table><thead><tr><th>#</th><th>課程</th><th>開始時間</th><th>重複規則</th></tr></thead><tbody>';
+    for (let i=0;i<previewCount;i++){
+      const ev = res.events[i];
+      html += `<tr><td>${i+1}</td><td>${escapeHtml(ev.summary)}</td><td>${escapeHtml(formatICalDateLocal(ev.dtstart))}</td><td>${escapeHtml(ev.rruleStr)}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    previewDiv.innerHTML = html;
+    statusDiv.textContent = `完成：產生 ${res.eventCount} 個事件。`;
+  });
+
+  downloadBtn.addEventListener('click', () => {
+    if (!lastICSBlob) return;
+    const u = URL.createObjectURL(lastICSBlob);
+    const a = document.createElement('a');
+    a.href = u; a.download = lastFilename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => { URL.revokeObjectURL(u); }, 500);
+  });
+
+  function escapeHtml(s){ if (!s) return ''; return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  </script>
+</body>
+</html>
